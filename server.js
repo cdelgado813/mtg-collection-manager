@@ -451,6 +451,17 @@ app.post('/api/check-deck', async (req, res) => {
   }
 });
 
+// Delete all cards
+app.delete('/api/cards/all', (req, res) => {
+  db.run('DELETE FROM cards', function(err) {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.json({ success: true, deleted: this.changes });
+    }
+  });
+});
+
 // Delete card
 app.delete('/api/cards/:id', (req, res) => {
   db.run('DELETE FROM cards WHERE id = ?', [req.params.id], function(err) {
