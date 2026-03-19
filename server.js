@@ -14,6 +14,9 @@ const DB_PATH = path.join(__dirname, 'data', 'collection.db');
 app.use(express.json());
 app.use(express.static('public'));
 
+// SSE clients for upload progress
+let uploadClients = [];
+
 // Multer config for CSV upload
 const upload = multer({ dest: 'uploads/' });
 
@@ -36,6 +39,8 @@ function initDB() {
       quantity INTEGER DEFAULT 1,
       foil INTEGER DEFAULT 0,
       condition TEXT DEFAULT 'NM',
+      binder_name TEXT,
+      binder_type TEXT,
       scryfall_id TEXT,
       image_uri TEXT,
       mana_cost TEXT,
@@ -80,43 +85,126 @@ async function fetchCardData(cardName, setCode = null) {
 
 // API Routes
 
-// Get all cards
+// Get all cards (with pagination)
 app.get('/api/cards', (req, res) => {
-  const { search, color, type, rarity, set } = req.query;
+  const { search, color, type, rarity, set, binder, page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  
   let query = 'SELECT * FROM cards WHERE 1=1';
+  let countQuery = 'SELECT COUNT(*) as total FROM cards WHERE 1=1';
   const params = [];
+  const countParams = [];
 
   if (search) {
     query += ' AND name LIKE ?';
+    countQuery += ' AND name LIKE ?';
     params.push(`%${search}%`);
+    countParams.push(`%${search}%`);
   }
   if (color) {
     query += ' AND colors LIKE ?';
+    countQuery += ' AND colors LIKE ?';
     params.push(`%${color}%`);
+    countParams.push(`%${color}%`);
   }
   if (type) {
     query += ' AND type_line LIKE ?';
+    countQuery += ' AND type_line LIKE ?';
     params.push(`%${type}%`);
+    countParams.push(`%${type}%`);
   }
   if (rarity) {
     query += ' AND rarity = ?';
+    countQuery += ' AND rarity = ?';
     params.push(rarity);
+    countParams.push(rarity);
   }
   if (set) {
     query += ' AND set_code = ?';
+    countQuery += ' AND set_code = ?';
     params.push(set.toUpperCase());
+    countParams.push(set.toUpperCase());
+  }
+  if (binder) {
+    query += ' AND binder_name LIKE ?';
+    countQuery += ' AND binder_name LIKE ?';
+    params.push(`%${binder}%`);
+    countParams.push(`%${binder}%`);
   }
 
-  query += ' ORDER BY name ASC';
+  query += ' ORDER BY name ASC LIMIT ? OFFSET ?';
+  params.push(parseInt(limit), offset);
 
-  db.all(query, params, (err, rows) => {
+  // Get total count
+  db.get(countQuery, countParams, (err, countRow) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+      return;
+    }
+
+    // Get paginated results
+    db.all(query, params, (err, rows) => {
+      if (err) {
+        res.status(500).json({ error: err.message });
+      } else {
+        res.json({
+          cards: rows,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total: countRow.total,
+            totalPages: Math.ceil(countRow.total / parseInt(limit))
+          }
+        });
+      }
+    });
+  });
+});
+
+// Get unique sets
+app.get('/api/sets', (req, res) => {
+  db.all('SELECT DISTINCT set_code FROM cards WHERE set_code IS NOT NULL ORDER BY set_code', (err, rows) => {
     if (err) {
       res.status(500).json({ error: err.message });
     } else {
-      res.json(rows);
+      res.json(rows.map(r => r.set_code));
     }
   });
 });
+
+// Get unique binders
+app.get('/api/binders', (req, res) => {
+  db.all('SELECT DISTINCT binder_name FROM cards WHERE binder_name IS NOT NULL ORDER BY binder_name', (err, rows) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.json(rows.map(r => r.binder_name));
+    }
+  });
+});
+
+// SSE endpoint for upload progress
+app.get('/api/upload-progress', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+
+  const clientId = Date.now();
+  const newClient = { id: clientId, res };
+  uploadClients.push(newClient);
+
+  req.on('close', () => {
+    uploadClients = uploadClients.filter(client => client.id !== clientId);
+  });
+});
+
+function sendProgressUpdate(data) {
+  uploadClients.forEach(client => {
+    client.res.write(`data: ${JSON.stringify(data)}\n\n`);
+  });
+}
 
 // Get collection stats
 app.get('/api/stats', (req, res) => {
@@ -187,44 +275,56 @@ app.post('/api/upload', upload.single('csv'), async (req, res) => {
 
     let imported = 0;
     let failed = 0;
+    const totalRecords = records.length;
 
     // Detect format (Manabox vs simple)
     const isManabox = records.length > 0 && records[0]['Scryfall ID'];
 
-    for (const record of records) {
-      let name, setCode, quantity, foil, condition, scryfallId;
+    // Send initial progress
+    sendProgressUpdate({ current: 0, total: totalRecords, status: 'starting' });
+
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i];
+      let name, setCode, quantity, foil, condition, scryfallId, binderName, binderType;
 
       if (isManabox) {
-        // Manabox format
         name = record['Name'];
         setCode = record['Set code'];
         quantity = parseInt(record['Quantity'] || 1);
         foil = (record['Foil'] === 'foil' || record['Foil'] === 'true') ? 1 : 0;
         condition = record['Condition'] || 'NM';
         scryfallId = record['Scryfall ID'];
+        binderName = record['Binder Name'];
+        binderType = record['Binder Type'];
       } else {
-        // Simple format
         name = record.nombre || record.name || record.Name;
         setCode = record.set || record.set_code || record['Set code'] || null;
         quantity = parseInt(record.cantidad || record.quantity || record.Quantity || 1);
         foil = (record.foil === 'true' || record.foil === '1' || record.Foil === 'foil') ? 1 : 0;
         condition = record.condicion || record.condition || record.Condition || 'NM';
         scryfallId = null;
+        binderName = record.binder || record.binder_name || null;
+        binderType = null;
       }
 
       if (!name) {
         failed++;
+        sendProgressUpdate({ 
+          current: i + 1, 
+          total: totalRecords, 
+          status: 'processing',
+          cardName: 'Invalid entry',
+          failed 
+        });
         continue;
       }
 
       let cardData = null;
 
-      // If we have Scryfall ID, use it directly (faster)
       if (scryfallId) {
         cardData = await fetchCardByID(scryfallId);
-        await new Promise(resolve => setTimeout(resolve, 75)); // Scryfall rate limit
+        await new Promise(resolve => setTimeout(resolve, 75));
       } else {
-        // Otherwise search by name/set
         cardData = await fetchCardData(name, setCode);
         await new Promise(resolve => setTimeout(resolve, 100));
       }
@@ -233,12 +333,12 @@ app.post('/api/upload', upload.single('csv'), async (req, res) => {
         await new Promise((resolve, reject) => {
           db.run(`
             INSERT INTO cards (
-              name, set_code, quantity, foil, condition,
+              name, set_code, quantity, foil, condition, binder_name, binder_type,
               scryfall_id, image_uri, mana_cost, type_line, 
               colors, rarity, price_usd, price_eur
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `, [
-            name, setCode, quantity, foil, condition,
+            name, setCode, quantity, foil, condition, binderName, binderType,
             cardData.scryfall_id, cardData.image_uri, cardData.mana_cost,
             cardData.type_line, cardData.colors, cardData.rarity,
             cardData.price_usd, cardData.price_eur
@@ -249,21 +349,38 @@ app.post('/api/upload', upload.single('csv'), async (req, res) => {
         });
         imported++;
       } else {
-        // Insert without Scryfall data
         await new Promise((resolve, reject) => {
           db.run(`
-            INSERT INTO cards (name, set_code, quantity, foil, condition)
-            VALUES (?, ?, ?, ?, ?)
-          `, [name, setCode, quantity, foil, condition], (err) => {
+            INSERT INTO cards (name, set_code, quantity, foil, condition, binder_name, binder_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `, [name, setCode, quantity, foil, condition, binderName, binderType], (err) => {
             if (err) reject(err);
             else resolve();
           });
         });
         imported++;
       }
+
+      // Send progress update
+      sendProgressUpdate({ 
+        current: i + 1, 
+        total: totalRecords, 
+        status: 'processing',
+        cardName: name,
+        imported,
+        failed
+      });
     }
 
-    fs.unlinkSync(req.file.path); // Clean up uploaded file
+    fs.unlinkSync(req.file.path);
+
+    sendProgressUpdate({ 
+      current: totalRecords, 
+      total: totalRecords, 
+      status: 'complete',
+      imported,
+      failed
+    });
 
     const formatDetected = isManabox ? 'Manabox' : 'Simple';
     res.json({ 
@@ -276,6 +393,60 @@ app.post('/api/upload', upload.single('csv'), async (req, res) => {
 
   } catch (error) {
     console.error('Upload error:', error);
+    sendProgressUpdate({ status: 'error', message: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check deck (what's missing)
+app.post('/api/check-deck', async (req, res) => {
+  const { decklist } = req.body;
+  
+  if (!decklist) {
+    return res.status(400).json({ error: 'No decklist provided' });
+  }
+
+  try {
+    const lines = decklist.split('\n').filter(l => l.trim());
+    const deckCards = [];
+    
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
+      
+      const match = trimmed.match(/^(\d+)\s+(.+)$/) || trimmed.match(/^(.+)$/);
+      if (match) {
+        const quantity = match[1] && !isNaN(match[1]) ? parseInt(match[1]) : 1;
+        const cardName = match[2] || match[1];
+        deckCards.push({ name: cardName.trim(), needed: quantity });
+      }
+    }
+
+    const results = [];
+    
+    for (const deckCard of deckCards) {
+      const owned = await new Promise((resolve, reject) => {
+        db.get(
+          'SELECT SUM(quantity) as total FROM cards WHERE name LIKE ?',
+          [`%${deckCard.name}%`],
+          (err, row) => {
+            if (err) reject(err);
+            else resolve(row?.total || 0);
+          }
+        );
+      });
+
+      results.push({
+        name: deckCard.name,
+        needed: deckCard.needed,
+        owned: owned,
+        missing: Math.max(0, deckCard.needed - owned),
+        status: owned >= deckCard.needed ? 'complete' : 'missing'
+      });
+    }
+
+    res.json({ results });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
